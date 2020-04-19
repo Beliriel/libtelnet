@@ -6,7 +6,7 @@
  * in this code to the public domain. We make this dedication for the benefit
  * of the public at large and to the detriment of our heirs and successors. We
  * intend this dedication to be an overt act of relinquishment in perpetuity of
- * all present and future rights to this code under copyright law. 
+ * all present and future rights to this code under copyright law.
  */
 
 #if !defined(_WIN32)
@@ -20,6 +20,7 @@
 #	include <netdb.h>
 #	include <poll.h>
 #	include <unistd.h>
+#   include <pthread.h>
 
 #	define SOCKET int
 #else
@@ -66,12 +67,25 @@
 # define COLOR_NORMAL ""
 #endif
 
+# define EXEC_CLNUP 1
+# define NO_EXEC_CLNUP 0
+# define USECS 10000
+
 struct conn_t {
 	const char *name;
 	SOCKET sock;
 	telnet_t *telnet;
 	struct conn_t *remote;
 };
+
+static pthread_mutex_t mutex_thread_count = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond_thread_count = PTHREAD_COND_INITIALIZER;
+static int conn_thread_count = 0;
+
+static const int THREAD_EXITED = 0;
+static const int THREAD_CANCELLED = 1;
+static const int THREAD_INITIALIZING = 2;
+static const int THREAD_ERROR = 3;
 
 static const char *get_cmd(unsigned char cmd) {
 	static char buffer[4];
@@ -330,182 +344,450 @@ static void _event_handler(telnet_t *telnet, telnet_event_t *ev,
 	}
 }
 
-int main(int argc, char **argv) {
-	char buffer[512];
-	short listen_port;
-	SOCKET listen_sock;
-	int rs;
-	struct sockaddr_in addr;
-	socklen_t addrlen;
-	struct pollfd pfd[2];
-	struct conn_t server;
-	struct conn_t client;
-	struct addrinfo *ai;
-	struct addrinfo hints;
+struct threadlist{
+    struct threadlist *next;
+    pthread_t thread_id;
+};
+
+struct cleanup_handler_args {
+    pthread_t thread_self;
+    int *thread_status;
+    struct threadlist* start_of_threadlist;
+    pthread_mutex_t *mutex_threadlist;
+
+    //only used for thread_gen_cleanup
+    struct conn_t *server;
+    struct conn_t *client;
+    SOCKET *listen_sock;
+};
+
+void* connection_cleanup_handler (void* args){
+    struct cleanup_handler_args *params = (struct cleanup_handler_args*)args;
+    int rc = 0;
+    struct threadlist *iter = params->start_of_threadlist;
+    struct threadlist *prev = NULL;
+
+    if(rc = pthread_mutex_lock(&mutex_thread_count)){
+        fprintf(stderr, "mutex_thread_count lock failed in "
+        "connection thread cleanup: %s\n", strerror(errno));
+    }
+    while(!pthread_equal(iter->thread_id, params->thread_self) && iter->next != NULL){
+        prev = iter;
+        iter = iter->next;
+    }
+
+    if(iter != NULL){
+        prev->next = iter->next;
+        iter->next = NULL;
+        free(iter);
+        iter = NULL;
+        printf("freeeing memory threadlist\n" );
+        conn_thread_count--;
+    } else {
+        printf("NULL threadlist element DETECTED\n" );
+    }
+    if(rc = pthread_mutex_unlock(&mutex_thread_count)){
+        fprintf(stderr, "mutex_thread_count unlock failed in "
+        "connection thread cleanup: %s\n", strerror(errno));
+    }
+
+    if( *(params->thread_status) == THREAD_INITIALIZING ){
+        if(rc = pthread_mutex_unlock(params->mutex_threadlist)){
+            fprintf(stderr, "mutex_threadlist unlock failed in "
+            "connection thread cleanup: %s\n", strerror(errno));
+        }
+        close(*(params->listen_sock));
+    }
+    else {
+        /* clean up */
+    	telnet_free(params->server->telnet);
+    	telnet_free(params->client->telnet);
+    	close(params->server->sock);
+    	close(params->client->sock);
+    }
+
+    return params->thread_status;
+}
+
+struct thread_arguments {
+    char **argv;
+    struct threadlist* start_of_threadlist;
+    pthread_mutex_t* mutex_threadlist;
+    pthread_cond_t* cond_threadlist;
+};
+
+void* run_connection(void* args){
+    struct thread_arguments *params = (struct thread_arguments *)args;
+    int rc = 0;
+    char buffer[512];
+    short listen_port;
+    SOCKET listen_sock;
+    int rs;
+    struct sockaddr_in addr;
+    socklen_t addrlen;
+    struct pollfd pfd[2];
+    struct conn_t server;
+    struct conn_t client;
+    struct addrinfo *ai;
+    struct addrinfo hints;
+    struct cleanup_handler_args cleanup_args;
+    cleanup_args.mutex_threadlist = params->mutex_threadlist;
+    cleanup_args.start_of_threadlist = params->start_of_threadlist;
+    cleanup_args.thread_status = &THREAD_INITIALIZING;
+    cleanup_args.thread_self = pthread_self();
+    cleanup_args.server = &server;
+    cleanup_args.client = &client;
+    cleanup_args.listen_sock = &listen_sock;
+    pthread_cleanup_push(connection_cleanup_handler, &cleanup_args);
+
+    if(rc = pthread_mutex_lock(params->mutex_threadlist)){
+        fprintf(stderr, "mutex_threadlist lock fail in connection thread: %s\n", strerror(errno));
+        pthread_exit(cleanup_args.thread_status);
+    }
+
+
 
 	/* initialize Winsock */
-#if defined(_WIN32)
-	WSADATA wsd;
-	WSAStartup(MAKEWORD(2, 2), &wsd);
-#endif
+    //re-add for final version
 
-	/* check usage */
+
+
+	/* parse listening port */
+	listen_port = (short)strtol(params->argv[3], 0, 10);
+
+	/* create listening socket */
+	if ((listen_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+		fprintf(stderr, "socket() failed: %s\n", strerror(errno));
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	/* reuse address option */
+	rs = 1;
+	setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char*)&rs, sizeof(rs));
+
+	/* bind to listening addr/port */
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_port = htons(listen_port);
+	if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "bind() failed: %s\n", strerror(errno));
+		close(listen_sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	printf("LISTENING ON PORT %d\n", listen_port);
+
+	/* wait for client */
+	if (listen(listen_sock, 1) == -1) {
+		fprintf(stderr, "listen() failed: %s\n", strerror(errno));
+		close(listen_sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+	addrlen = sizeof(addr);
+	if ((client.sock = accept(listen_sock, (struct sockaddr *)&addr,
+			&addrlen)) == -1) {
+		fprintf(stderr, "accept() failed: %s\n", strerror(errno));
+		close(listen_sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	printf("CLIENT CONNECTION RECEIVED\n");
+
+	/* stop listening now that we have a client */
+	close(listen_sock);
+
+	/* look up server host */
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if ((rs = getaddrinfo(params->argv[1], params->argv[2], &hints, &ai)) != 0) {
+		fprintf(stderr, "getaddrinfo() failed for %s: %s\n", params->argv[1],
+				gai_strerror(rs));
+		close(client.sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	/* create server socket */
+	if ((server.sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+		fprintf(stderr, "socket() failed: %s\n", strerror(errno));
+		close(server.sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	/* bind server socket */
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	if (bind(server.sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "bind() failed: %s\n", strerror(errno));
+		close(server.sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	/* connect */
+	if (connect(server.sock, ai->ai_addr, (int)ai->ai_addrlen) == -1) {
+		fprintf(stderr, "server() failed: %s\n", strerror(errno));
+		close(server.sock);
+        pthread_exit(cleanup_args.thread_status);
+	}
+
+	/* free address lookup info */
+	freeaddrinfo(ai);
+
+	printf("SERVER CONNECTION ESTABLISHED\n");
+
+	/* initialize connection structs */
+	server.name = COLOR_SERVER "SERVER";
+	server.remote = &client;
+	client.name = COLOR_CLIENT "CLIENT";
+	client.remote = &server;
+
+	/* initialize telnet boxes */
+	server.telnet = telnet_init(0, _event_handler, TELNET_FLAG_PROXY,
+			&server);
+	client.telnet = telnet_init(0, _event_handler, TELNET_FLAG_PROXY,
+			&client);
+
+	/* initialize poll descriptors */
+	memset(pfd, 0, sizeof(pfd));
+	pfd[0].fd = server.sock;
+	pfd[0].events = POLLIN;
+	pfd[1].fd = client.sock;
+	pfd[1].events = POLLIN;
+
+    if(rc = pthread_mutex_unlock(params->mutex_threadlist)){
+        fprintf(stderr, "mutex_threadlist unlock fail in connection thread: %s\n", strerror(errno));
+        pthread_exit(cleanup_args.thread_status);
+    }
+    cleanup_args.thread_status = &THREAD_CANCELLED;
+    if(rc = pthread_cond_signal(params->cond_threadlist)){
+        fprintf(stderr, "pthread_cond_signal failed: %s\n", strerror(errno));
+        pthread_exit(cleanup_args.thread_status);
+    }
+
+
+	/* loop while both connections are open */
+	while (poll(pfd, 2, -1) != -1) {
+		/* read from server */
+		if (pfd[0].revents & POLLIN) {
+			if ((rs = recv(server.sock, buffer, sizeof(buffer), 0)) > 0) {
+				telnet_recv(server.telnet, buffer, rs);
+			} else if (rs == 0) {
+				printf("%s DISCONNECTED" COLOR_NORMAL "\n", server.name);
+				break;
+			} else {
+				if (errno != EINTR && errno != ECONNRESET) {
+					fprintf(stderr, "recv(server) failed: %s\n",
+							strerror(errno));
+					pthread_exit(cleanup_args.thread_status);
+				}
+			}
+		}
+
+		/* read from client */
+		if (pfd[1].revents & POLLIN) {
+			if ((rs = recv(client.sock, buffer, sizeof(buffer), 0)) > 0) {
+				telnet_recv(client.telnet, buffer, rs);
+			} else if (rs == 0) {
+				printf("%s DISCONNECTED" COLOR_NORMAL "\n", client.name);
+				break;
+			} else {
+				if (errno != EINTR && errno != ECONNRESET) {
+					fprintf(stderr, "recv(server) failed: %s\n",
+							strerror(errno));
+					pthread_exit(cleanup_args.thread_status);
+				}
+			}
+		}
+	}
+
+
+
+	/* all done */
+	printf("BOTH CONNECTIONS CLOSED\n");
+
+    /* exit thread and call cleanup handler*/
+    cleanup_args.thread_status = &THREAD_EXITED;
+    pthread_exit(cleanup_args.thread_status);
+    pthread_cleanup_pop(EXEC_CLNUP);
+
+    /* will never reach this */
+    return 0;
+}
+
+void* thread_generation_cleanup(void* args){
+    struct cleanup_handler_args *params = (struct cleanup_handler_args*)args;
+    struct threadlist *connection_threads = params->start_of_threadlist;
+    int rc = 0;
+
+    //cancel all connection threads
+    while(connection_threads->next != NULL){
+        connection_threads = connection_threads->next;
+        if(rc = pthread_cancel(connection_threads->thread_id)){
+            fprintf(stderr, "cancelling thread failed in "
+            "thread generation cleanup: %s (%d)\n", strerror(errno), rc);
+        }
+    }
+
+    if(rc = pthread_mutex_trylock(&mutex_thread_count)){
+        fprintf(stderr, "mutex already locked by thread: %s\n"
+        "continuing with cleanup\n", strerror(rc));
+    }
+
+    do {
+
+        if(rc = pthread_mutex_unlock(&mutex_thread_count)){
+            fprintf(stderr, "mutex_thread_count unlock failed "
+            "in thread generation cleanup: %s\n", strerror(errno));
+        }
+        if(rc = usleep(USECS * 90)){
+            fprintf(stderr, "usleep failed in thread generation cleanup: %s\n",
+            strerror(errno));
+        }
+        if(rc = pthread_mutex_lock(&mutex_thread_count)){
+            fprintf(stderr, "mutex_thread_csocket.h listenount lock failed in "
+            "thread generation cleanup: %s\n", strerror(errno));
+        }
+    } while (conn_thread_count > 0);
+    if(rc = pthread_mutex_unlock(&mutex_thread_count)){
+        fprintf(stderr, "mutex_thread_count unlock failed in "
+        "thread generation cleanup: %s\n", strerror(errno));
+    }
+
+    free(params->start_of_threadlist);
+    printf("freeing start_of_threadlist\n" );
+    return &THREAD_EXITED;
+}
+
+void* run_thread_generation(void* arg){
+    char** argv = (char**)arg;
+    int rc = 0;
+    struct threadlist* start_of_threadlist = calloc(1,
+        sizeof(struct threadlist));
+    printf("allocation start_of_threadlist\n" );
+    start_of_threadlist->next = NULL;
+    start_of_threadlist->thread_id = pthread_self();
+
+
+    pthread_mutex_t mutex_threadlist = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond_threadlist = PTHREAD_COND_INITIALIZER;
+
+    struct cleanup_handler_args cleanup_args;
+    cleanup_args.thread_self = start_of_threadlist->thread_id;
+    cleanup_args.start_of_threadlist = start_of_threadlist;
+    cleanup_args.mutex_threadlist = &mutex_threadlist;
+    pthread_cleanup_push(thread_generation_cleanup, &cleanup_args);
+
+    struct thread_arguments thread_arg;
+    thread_arg.argv = argv;
+    thread_arg.start_of_threadlist = start_of_threadlist;
+    thread_arg.mutex_threadlist = &mutex_threadlist;
+    thread_arg.cond_threadlist = &cond_threadlist;
+
+    for(;;) {
+
+        if(rc = pthread_mutex_lock(&mutex_thread_count)){
+                fprintf(stderr, "mutex_thread_count lock failed in "
+                "thread generation: %s\n", strerror(errno));
+                pthread_exit(NULL);
+        }
+        struct threadlist* iter = start_of_threadlist;
+        while(iter->next!=NULL){
+            iter = iter->next;
+        }
+
+        if(conn_thread_count>0){
+            if(rc = pthread_cond_wait(&cond_threadlist, &mutex_threadlist)){
+                fprintf(stderr, "pthread_cond_wait failed in "
+                "thread generation: %s\n", strerror(errno));
+                pthread_exit(NULL);
+            }
+        } else {
+            pthread_testcancel();
+            if(rc = pthread_mutex_lock(&mutex_threadlist)){
+                fprintf(stderr, "mutex_threadlist lock failed in "
+                "thread generation: %s\n", strerror(errno));
+                pthread_exit(NULL);
+            }
+        }
+        iter->next = calloc(1, sizeof(struct threadlist));
+        printf("allocation thread\n" );
+
+        if(rc = pthread_mutex_unlock(&mutex_thread_count)){
+            fprintf(stderr, "mutex_thread_count unlock failed in "
+            "thread generation: %s\n", strerror(errno));
+            pthread_exit(NULL);
+        }
+        if(rc = pthread_create(&(iter->next->thread_id), NULL,
+        run_connection, &thread_arg)){
+            fprintf(stderr, "pthread_create failed in "
+            "thread generation: %s\n", strerror(errno));
+            pthread_exit(NULL);
+        }
+
+        if(rc = pthread_mutex_lock(&mutex_thread_count)){
+            fprintf(stderr, "mutex_thread_count lock failed in "
+            "thread generation: %s\n", strerror(errno));
+            pthread_exit(NULL);
+        }
+
+        conn_thread_count++;
+        if(rc = pthread_mutex_unlock(&mutex_thread_count)){
+            fprintf(stderr, "mutex_thread_count unlock failed in "
+            "thread generation: %s\n", strerror(errno));
+            pthread_exit(NULL);
+        }
+        if(rc = pthread_mutex_unlock(&mutex_threadlist)){
+            fprintf(stderr, "mutex_threadlist unlock failed in "
+            "thread generation: %s\n", strerror(errno));
+            pthread_exit(NULL);
+        }
+
+        if(rc = usleep(USECS)){
+            fprintf(stderr, "usleep failed in "
+            "thread generation: %s\n", strerror(errno));
+            pthread_exit(NULL);
+        }
+    }
+
+    pthread_cleanup_pop(EXEC_CLNUP);
+
+    /* will never reach this */
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int rc = 0;
+    /* check usage */
 	if (argc != 4) {
 		fprintf(stderr, "Usage:\n ./telnet-proxy <remote ip> <remote port> "
 				"<local port>\n");
 		return 1;
 	}
+    printf("Press \'x\' and ENTER to close the program\n");
+    pthread_t thread_generation;
+    if(pthread_create(&thread_generation, NULL, run_thread_generation, argv)){
+        fprintf(stderr, "pthread_create failed in "
+        "main thread: %s\n", strerror(errno));
+        return 1;
+    }
 
-	/* parse listening port */
-	listen_port = (short)strtol(argv[3], 0, 10);
+    int c = 0;
+    while(c != 'x'){
+        c = getchar();
+    }
 
-	/* loop forever, until user kills process */
-	for (;;) {
-		/* create listening socket */
-		if ((listen_sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-			fprintf(stderr, "socket() failed: %s\n", strerror(errno));
-			return 1;
-		}
+    printf("closing program\n");
+    if(rc = pthread_cancel(thread_generation)){
+        fprintf(stderr, "pthread_cancel failed in "
+        "main thread: %s\n", strerror(errno));
+        return 1;
+    }
+    if(rc = pthread_join(thread_generation, NULL)){
+        fprintf(stderr, "pthread_join failed in "
+        "main thread: %s\n", strerror(errno));
+        return 1;
+    }
 
-		/* reuse address option */
-		rs = 1;
-		setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char*)&rs, sizeof(rs));
-
-		/* bind to listening addr/port */
-		memset(&addr, 0, sizeof(addr));
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = INADDR_ANY;
-		addr.sin_port = htons(listen_port);
-		if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-			fprintf(stderr, "bind() failed: %s\n", strerror(errno));
-			close(listen_sock);
-			return 1;
-		}
-
-		printf("LISTENING ON PORT %d\n", listen_port);
-
-		/* wait for client */
-		if (listen(listen_sock, 1) == -1) {
-			fprintf(stderr, "listen() failed: %s\n", strerror(errno));
-			close(listen_sock);
-			return 1;
-		}
-		addrlen = sizeof(addr);
-		if ((client.sock = accept(listen_sock, (struct sockaddr *)&addr,
-				&addrlen)) == -1) {
-			fprintf(stderr, "accept() failed: %s\n", strerror(errno));
-			close(listen_sock);
-			return 1;
-		}
-
-		printf("CLIENT CONNECTION RECEIVED\n");
-		
-		/* stop listening now that we have a client */
-		close(listen_sock);
-
-		/* look up server host */
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		if ((rs = getaddrinfo(argv[1], argv[2], &hints, &ai)) != 0) {
-			fprintf(stderr, "getaddrinfo() failed for %s: %s\n", argv[1],
-					gai_strerror(rs));
-			close(client.sock);
-			return 1;
-		}
-		
-		/* create server socket */
-		if ((server.sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-			fprintf(stderr, "socket() failed: %s\n", strerror(errno));
-			close(server.sock);
-			return 1;
-		}
-
-		/* bind server socket */
-		memset(&addr, 0, sizeof(addr));
-		addr.sin_family = AF_INET;
-		if (bind(server.sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-			fprintf(stderr, "bind() failed: %s\n", strerror(errno));
-			close(server.sock);
-			return 1;
-		}
-
-		/* connect */
-		if (connect(server.sock, ai->ai_addr, (int)ai->ai_addrlen) == -1) {
-			fprintf(stderr, "server() failed: %s\n", strerror(errno));
-			close(server.sock);
-			return 1;
-		}
-
-		/* free address lookup info */
-		freeaddrinfo(ai);
-
-		printf("SERVER CONNECTION ESTABLISHED\n");
-
-		/* initialize connection structs */
-		server.name = COLOR_SERVER "SERVER";
-		server.remote = &client;
-		client.name = COLOR_CLIENT "CLIENT";
-		client.remote = &server;
-
-		/* initialize telnet boxes */
-		server.telnet = telnet_init(0, _event_handler, TELNET_FLAG_PROXY,
-				&server);
-		client.telnet = telnet_init(0, _event_handler, TELNET_FLAG_PROXY,
-				&client);
-
-		/* initialize poll descriptors */
-		memset(pfd, 0, sizeof(pfd));
-		pfd[0].fd = server.sock;
-		pfd[0].events = POLLIN;
-		pfd[1].fd = client.sock;
-		pfd[1].events = POLLIN;
-
-		/* loop while both connections are open */
-		while (poll(pfd, 2, -1) != -1) {
-			/* read from server */
-			if (pfd[0].revents & POLLIN) {
-				if ((rs = recv(server.sock, buffer, sizeof(buffer), 0)) > 0) {
-					telnet_recv(server.telnet, buffer, rs);
-				} else if (rs == 0) {
-					printf("%s DISCONNECTED" COLOR_NORMAL "\n", server.name);
-					break;
-				} else {
-					if (errno != EINTR && errno != ECONNRESET) {
-						fprintf(stderr, "recv(server) failed: %s\n",
-								strerror(errno));
-						exit(1);
-					}
-				}
-			}
-
-			/* read from client */
-			if (pfd[1].revents & POLLIN) {
-				if ((rs = recv(client.sock, buffer, sizeof(buffer), 0)) > 0) {
-					telnet_recv(client.telnet, buffer, rs);
-				} else if (rs == 0) {
-					printf("%s DISCONNECTED" COLOR_NORMAL "\n", client.name);
-					break;
-				} else {
-					if (errno != EINTR && errno != ECONNRESET) {
-						fprintf(stderr, "recv(server) failed: %s\n",
-								strerror(errno));
-						exit(1);
-					}
-				}
-			}
-		}
-
-		/* clean up */
-		telnet_free(server.telnet);
-		telnet_free(client.telnet);
-		close(server.sock);
-		close(client.sock);
-
-		/* all done */
-		printf("BOTH CONNECTIONS CLOSED\n");
-	}
-
-	/* not that we can reach this, but GCC will cry if it's not here */
 	return 0;
 }

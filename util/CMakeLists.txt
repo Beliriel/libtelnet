@@ -20,6 +20,7 @@ target_link_libraries(telnet-test
 add_executable(telnet-proxy telnet-proxy.c)
 target_link_libraries(telnet-proxy
     libtelnet
+    -lpthread
     $<$<C_COMPILER_ID:MSVC>:wsock32>
     $<$<C_COMPILER_ID:MSVC>:ws2_32>
 )
