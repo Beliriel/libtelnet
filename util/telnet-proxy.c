@@ -79,7 +79,7 @@ struct conn_t {
 	struct conn_t *remote;
 };
 
-struct ticket_lock {
+struct ticket_lock_t {
     pthread_cond_t cond;
     pthread_mutex_t mutex;
     unsigned long queue_head;
@@ -95,7 +95,7 @@ struct ticket_lock {
 }*/
 #define TICKET_LOCK_INITIALIZER { PTHREAD_COND_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, 0, 0 }
 
-void ticket_lock(struct ticket_lock *ticket)
+void ticket_lock(struct ticket_lock_t *ticket)
 {
     unsigned long queue_me;
 
@@ -108,7 +108,7 @@ void ticket_lock(struct ticket_lock *ticket)
     pthread_mutex_unlock(&ticket->mutex);
 }
 
-void ticket_unlock(struct ticket_lock *ticket)
+void ticket_unlock(struct ticket_lock_t *ticket)
 {
     pthread_mutex_lock(&ticket->mutex);
     ticket->queue_head++;
@@ -386,6 +386,7 @@ struct threadlist{
     struct threadlist *next;
     struct threadlist *prev;
     pthread_t thread_id;
+    SOCKET *listen_sock;
 };
 
 void delete_threadlist_element(struct threadlist *item)
@@ -407,6 +408,7 @@ struct cleanup_handler_args {
     int *thread_status;
     struct threadlist* threadlist_element;
     pthread_mutex_t *mutex_threadlist;
+    struct ticket_lock_t * ticket;
 
     //only used for thread_gen_cleanup
     struct conn_t *server;
@@ -420,37 +422,17 @@ void* connection_cleanup_handler (void* args){
     struct threadlist *iter = params->threadlist_element;
     struct threadlist *prev = NULL;
     
-/*
-    while(!pthread_equal(iter->thread_id, params->thread_self) && iter->next != NULL){
-        prev = iter;
-        iter = iter->next;
-    }
-*/
-    if(params->thread_status == THREAD_EXITED || params->thread_status == THREAD_ERROR)
+
+    if(*(params->thread_status) == THREAD_EXITED || *(params->thread_status) == THREAD_ERROR
+            || *(params->thread_status) == THREAD_INITIALIZING )
     {
-        if(rc = pthread_mutex_lock(params->mutex_threadlist)){
-            fprintf(stderr, "mutex_threadlist lock failed in "
-            "connection thread cleanup: %s\n", strerror(errno));
-        }
+        ticket_lock(params->ticket);
         delete_threadlist_element(params->threadlist_element);
-        if(rc = pthread_mutex_unlock(params->mutex_threadlist)){
-            fprintf(stderr, "mutex_threadlist unlock failed in "
-            "connection thread cleanup: %s\n", strerror(errno));
-        }
+        ticket_unlock(params->ticket);
+    }
+    
+    if( *(params->thread_status) != THREAD_INITIALIZING ){
         
-    }
-    
-    
-    if( *(params->thread_status) == THREAD_INITIALIZING ){
-/*
-        if(rc = pthread_mutex_unlock(params->mutex_threadlist)){
-            fprintf(stderr, "mutex_threadlist unlock failed in "
-            "connection thread cleanup: %s\n", strerror(errno));
-        }
-*/
-        close(*(params->listen_sock));
-    }
-    else {
         /* clean up */
     	telnet_free(params->server->telnet);
     	telnet_free(params->client->telnet);
@@ -463,12 +445,9 @@ void* connection_cleanup_handler (void* args){
 
 struct thread_arguments {
     char **argv;
-    short localport;
-    char service[20];
-    char node[100]; //webaddress or ip-address
     struct threadlist* threadlist_element;
-    pthread_mutex_t* mutex_threadlist;
     pthread_cond_t* cond_threadlist;
+    struct ticket_lock_t * ticket;
 };
 
 void* run_connection(void* args){
@@ -486,25 +465,21 @@ void* run_connection(void* args){
     struct addrinfo *ai;
     struct addrinfo hints;
     struct cleanup_handler_args cleanup_args;
-    cleanup_args.mutex_threadlist = params->mutex_threadlist;
     cleanup_args.threadlist_element = params->threadlist_element;
     cleanup_args.thread_status = &THREAD_INITIALIZING;
     cleanup_args.thread_self = pthread_self();
     cleanup_args.server = &server;
     cleanup_args.client = &client;
     cleanup_args.listen_sock = &listen_sock;
+    cleanup_args.ticket = params->ticket;
     pthread_cleanup_push(connection_cleanup_handler, &cleanup_args);
-
-/*
-    if(rc = pthread_mutex_lock(params->mutex_threadlist)){
-        fprintf(stderr, "mutex_threadlist lock fail in connection thread: %s\n", strerror(errno));
-        pthread_exit(cleanup_args.thread_status);
-    }
-*/
-
-
-
-	/* initialize Winsock */
+    
+    ticket_lock(params->ticket);
+    params->threadlist_element->listen_sock = &listen_sock;
+    ticket_unlock(params->ticket);
+    
+    
+    /* initialize Winsock */
     //re-add for final version
 
 
@@ -544,9 +519,9 @@ void* run_connection(void* args){
 	addrlen = sizeof(addr);
 	if ((client.sock = accept(listen_sock, (struct sockaddr *)&addr,
 			&addrlen)) == -1) {
-		fprintf(stderr, "accept() failed: %s\n", strerror(errno));
+		fprintf(stderr, "accept() interrupted: %s\n", strerror(errno));
 		close(listen_sock);
-        pthread_exit(cleanup_args.thread_status);
+                pthread_exit(cleanup_args.thread_status);
 	}
 
 	printf("CLIENT CONNECTION RECEIVED\n");
@@ -612,12 +587,6 @@ void* run_connection(void* args){
 	pfd[1].fd = client.sock;
 	pfd[1].events = POLLIN;
 
-/*
-    if(rc = pthread_mutex_unlock(params->mutex_threadlist)){
-        fprintf(stderr, "mutex_threadlist unlock fail in connection thread: %s\n", strerror(errno));
-        pthread_exit(cleanup_args.thread_status);
-    }
-*/
     cleanup_args.thread_status = &THREAD_CANCELLED;
     if(rc = pthread_cond_signal(params->cond_threadlist)){
         fprintf(stderr, "pthread_cond_signal failed: %s\n", strerror(errno));
@@ -627,47 +596,45 @@ void* run_connection(void* args){
     free(params);
 
 
-	/* loop while both connections are open */
-	while (poll(pfd, 2, -1) != -1) {
-		/* read from server */
-		if (pfd[0].revents & POLLIN) {
-			if ((rs = recv(server.sock, buffer, sizeof(buffer), 0)) > 0) {
-				telnet_recv(server.telnet, buffer, rs);
-			} else if (rs == 0) {
-				printf("%s DISCONNECTED" COLOR_NORMAL "\n", server.name);
-				break;
-			} else {
-				if (errno != EINTR && errno != ECONNRESET) {
-					fprintf(stderr, "recv(server) failed: %s\n",
-							strerror(errno));
-                                        cleanup_args.thread_status = &THREAD_ERROR;
-					pthread_exit(cleanup_args.thread_status);
-				}
-			}
-		}
+    /* loop while both connections are open */
+    while (poll(pfd, 2, -1) != -1) {
+            /* read from server */
+            if (pfd[0].revents & POLLIN) {
+                    if ((rs = recv(server.sock, buffer, sizeof(buffer), 0)) > 0) {
+                            telnet_recv(server.telnet, buffer, rs);
+                    } else if (rs == 0) {
+                            printf("%s DISCONNECTED" COLOR_NORMAL "\n", server.name);
+                            break;
+                    } else {
+                            if (errno != EINTR && errno != ECONNRESET) {
+                                    fprintf(stderr, "recv(server) failed: %s\n",
+                                                    strerror(errno));
+                                    cleanup_args.thread_status = &THREAD_ERROR;
+                                    pthread_exit(cleanup_args.thread_status);
+                            }
+                    }
+            }
 
-		/* read from client */
-		if (pfd[1].revents & POLLIN) {
-			if ((rs = recv(client.sock, buffer, sizeof(buffer), 0)) > 0) {
-				telnet_recv(client.telnet, buffer, rs);
-			} else if (rs == 0) {
-				printf("%s DISCONNECTED" COLOR_NORMAL "\n", client.name);
-				break;
-			} else {
-				if (errno != EINTR && errno != ECONNRESET) {
-					fprintf(stderr, "recv(server) failed: %s\n",
-							strerror(errno));
-					cleanup_args.thread_status = &THREAD_ERROR;
-                                        pthread_exit(cleanup_args.thread_status);
-				}
-			}
-		}
-	}
-
-
-
-	/* all done */
-	printf("BOTH CONNECTIONS CLOSED\n");
+            /* read from client */
+            if (pfd[1].revents & POLLIN) {
+                    if ((rs = recv(client.sock, buffer, sizeof(buffer), 0)) > 0) {
+                            telnet_recv(client.telnet, buffer, rs);
+                    } else if (rs == 0) {
+                            printf("%s DISCONNECTED" COLOR_NORMAL "\n", client.name);
+                            break;
+                    } else {
+                            if (errno != EINTR && errno != ECONNRESET) {
+                                    fprintf(stderr, "recv(server) failed: %s\n",
+                                                    strerror(errno));
+                                    cleanup_args.thread_status = &THREAD_ERROR;
+                                    pthread_exit(cleanup_args.thread_status);
+                            }
+                    }
+            }
+    }
+    
+    /* all done */
+    printf("BOTH CONNECTIONS CLOSED\n");
 
     /* exit thread and call cleanup handler*/
     cleanup_args.thread_status = &THREAD_EXITED;
@@ -683,25 +650,43 @@ void* thread_generation_cleanup(void* args){
     struct threadlist *connection_threads = params->threadlist_element;
     struct threadlist *to_delete = NULL;
     int rc = 0;
-
+    
+    if(rc = pthread_mutex_unlock(params->mutex_threadlist)){
+                fprintf(stderr, "mutex_threadlist unlock failed in "
+                "thread generation cleanup: %s\n", strerror(errno));
+                pthread_exit(NULL);
+        }
+    
+    
+        
     //cancel all connection threads
     while(connection_threads->next != NULL){
-        
+        printf("blubb\n");
+        ticket_lock(params->ticket);
+        printf("grap\n");
         if(rc = pthread_cancel(connection_threads->thread_id)){
             fprintf(stderr, "cancelling thread failed in "
             "thread generation cleanup: %s (%d)\n", strerror(errno), rc);
         }
+        
+        ticket_unlock(params->ticket);
         if(rc = pthread_join(connection_threads->thread_id, NULL)){
             fprintf(stderr, "waiting for thread failed in "
-            "thread generation cleanup: %s (%d)\n", strerror(errno), rc);
+            "thread generation cleanup: %s (%d)\n", strerror(rc), rc);
         }
+        ticket_lock(params->ticket);
         to_delete = connection_threads;
         connection_threads = connection_threads->next;
         delete_threadlist_element(to_delete);
+        ticket_unlock(params->ticket);
+    }
+    
+    printf("trying to shutdown socket\n");
+    if(rc = shutdown(*(connection_threads->listen_sock), SHUT_RDWR)){
+        fprintf(stderr, "shutting down socket failed in "
+        "thread generation cleanup: %s (%d)\n", strerror(errno), rc);
     }
 
-    free(params->threadlist_element);
-    printf("freeing start_of_threadlist\n" );
     return &THREAD_EXITED;
 }
 
@@ -720,6 +705,7 @@ void* run_thread_generation(void* arg){
     
     pthread_mutex_t mutex_threadlist = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cond_threadlist = PTHREAD_COND_INITIALIZER;
+    struct ticket_lock_t ticket_threadlist = TICKET_LOCK_INITIALIZER;
 
     struct cleanup_handler_args cleanup_args;
     cleanup_args.thread_self = start_of_threadlist->thread_id;
@@ -727,14 +713,10 @@ void* run_thread_generation(void* arg){
     cleanup_args.mutex_threadlist = &mutex_threadlist;
     pthread_cleanup_push(thread_generation_cleanup, &cleanup_args);
 
-    struct thread_arguments thread_arg_template;
-    thread_arg_template.argv = argv;
-    thread_arg_template.threadlist_element = start_of_threadlist;
-    thread_arg_template.mutex_threadlist = &mutex_threadlist;
-    thread_arg_template.cond_threadlist = &cond_threadlist;
+    ticket_lock(&ticket_threadlist);
 
     for(;;) {
-
+        
         if(rc = pthread_mutex_lock(&mutex_threadlist)){
                 fprintf(stderr, "mutex_threadlist lock failed in "
                 "thread generation: %s\n", strerror(errno));
@@ -746,7 +728,7 @@ void* run_thread_generation(void* arg){
         }
         end_of_threadlist = iter;
         
-        printf("bloah1\n");
+        ticket_unlock(&ticket_threadlist);
         
         if(conn_thread_count)
         {
@@ -755,22 +737,23 @@ void* run_thread_generation(void* arg){
                 "thread generation: %s\n", strerror(errno));
                 pthread_exit(NULL);
             }
+            
+            ticket_lock(&ticket_threadlist);
+            end_of_threadlist->next = calloc(1, sizeof(struct threadlist));
+            end_of_threadlist->next->prev = end_of_threadlist;
+            end_of_threadlist->next->next = NULL;
+            end_of_threadlist = end_of_threadlist->next;
         }
         else {
             pthread_testcancel();
+            ticket_lock(&ticket_threadlist);
         }
         
-        printf("bloah2\n");
-        
-        end_of_threadlist->next = calloc(1, sizeof(struct threadlist));
-        end_of_threadlist->next->prev = end_of_threadlist;
-        end_of_threadlist->next->next = NULL;
-        end_of_threadlist = end_of_threadlist->next;
         struct thread_arguments *thread_arg = calloc(1, sizeof(struct thread_arguments));
         thread_arg->argv = argv;
         thread_arg->cond_threadlist = &cond_threadlist;
-        thread_arg->mutex_threadlist = &mutex_threadlist;
         thread_arg->threadlist_element = end_of_threadlist;
+        thread_arg->ticket = &ticket_threadlist;
         printf("allocation thread\n" );
         
         if(rc = pthread_create(&(end_of_threadlist->thread_id), NULL,
@@ -789,11 +772,13 @@ void* run_thread_generation(void* arg){
         }
         
 
+/*
         if(rc = usleep(USECS)){
             fprintf(stderr, "usleep failed in "
             "thread generation: %s\n", strerror(errno));
             pthread_exit(NULL);
         }
+*/
     }
 
     pthread_cleanup_pop(EXEC_CLNUP);
